@@ -55,6 +55,7 @@
     <button id="prevSeg">⏮ Prev segment</button>
     <button id="nextSeg">Next segment ⏭</button>
     <button id="nextNC">Skip to next non-content ▶▶</button>
+    <button id="nextContent">Skip to next content ▶▶</button>
     <button id="speedBtn">Playback: 1x</button>
     <button id="autoSkip">Auto-skip: <b id="autoSkipState">off</b></button>
   </div>
@@ -290,6 +291,16 @@ function nextNonContent() {
     }
   }
 }
+function nextContent() {
+  const t = video.currentTime;
+  for (const s of segments) {
+    if (s.start_sec > t && !NON_CONTENT.has(s.label)) {
+      video.currentTime = s.start_sec;
+      video.play();
+      return;
+    }
+  }
+}
 function prevSeg() {
   const t = video.currentTime;
   let last = segments[0];
@@ -419,6 +430,7 @@ function init() {
   $("prevSeg").onclick = prevSeg;
   $("nextSeg").onclick = nextSeg;
   $("nextNC").onclick = nextNonContent;
+  $("nextContent").onclick = nextContent;
   $("speedBtn").onclick = () => {
     speedIdx = (speedIdx + 1) % speeds.length;
     video.playbackRate = speeds[speedIdx];
@@ -435,6 +447,7 @@ function init() {
     if (e.key === "l") nextSeg();
     if (e.key === "k") video.paused ? video.play() : video.pause();
     if (e.key === "s") nextNonContent();
+    if (e.key === "c") nextContent();
   });
 }
 
