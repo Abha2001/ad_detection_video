@@ -5,6 +5,9 @@ Usage:
         --work-dir ./work \
         --boundaries cuts.json \
         --whisper-model base
+
+If --boundaries is not provided, boundaries are auto-detected by combining
+visual frame-difference cuts with audio silence midpoints.
 """
 from __future__ import annotations
 
@@ -33,6 +36,41 @@ def get_video_duration(video_path: Path) -> float:
     return (n / fps) if fps and fps > 0 else 0.0
 
 
+def auto_detect_boundaries(
+    video_path: Path,
+    wav_path: Path,
+    adaptive_k: float = 1.0,
+    sample_every: int = 5,
+) -> List[float]:
+    """Run visual frame-diff + audio silence detection and merge the cuts."""
+    from .audio_boundaries import detect_silence_boundaries, merge_boundaries
+    from .boundary import detect_boundaries_sec
+
+    visual_b: List[float] = []
+    try:
+        visual_b = detect_boundaries_sec(
+            video_path,
+            detector_key="frame_diff",
+            sample_every=sample_every,
+            adaptive_k=adaptive_k,
+        )
+    except Exception as e:
+        print(f"[boundaries] visual detection failed: {e}")
+
+    audio_b: List[float] = []
+    try:
+        audio_b = detect_silence_boundaries(wav_path)
+    except Exception as e:
+        print(f"[boundaries] audio detection failed: {e}")
+
+    merged = merge_boundaries(visual_b, audio_b)
+    print(
+        f"[boundaries] {len(visual_b)} visual + {len(audio_b)} audio "
+        f"-> {len(merged)} merged cuts"
+    )
+    return merged
+
+
 def run(
     video_path: Path,
     work_dir: Path,
@@ -42,12 +80,17 @@ def run(
 ) -> Path:
     work_dir.mkdir(parents=True, exist_ok=True)
     duration = get_video_duration(video_path)
-    boundaries = boundaries_sec or []
-
-    segments = segments_from_boundaries(boundaries, duration)
 
     wav_path = work_dir / (video_path.stem + ".wav")
     extract_wav(video_path, wav_path)
+
+    if boundaries_sec is None:
+        boundaries = auto_detect_boundaries(video_path, wav_path)
+    else:
+        boundaries = boundaries_sec
+
+    segments = segments_from_boundaries(boundaries, duration)
+    print(f"[segments] built {len(segments)} segments from {len(boundaries)} boundaries")
 
     asr = transcribe(wav_path, model_size=whisper_model)
     assign_asr_to_segments(asr, segments)
