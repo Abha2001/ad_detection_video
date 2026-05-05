@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Multimodal Content Map</title>
+<style>
+  :root {
+    --bg: #11141a; --panel: #1a1f2a; --fg: #e7eaf0; --muted: #8a93a3;
+    --core: #4caf50; --intro: #5a9bff; --outro: #b78bff;
+    --sponsor: #ff5252; --selfpromo: #ff9f3f; --recap: #f1c40f;
+    --transition: #888c94; --deadair: #404654; --waiting: #2c5282;
+    --filler: #b8651a; --unknown: #6b7280;
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 -apple-system,Segoe UI,Roboto,sans-serif; }
+  header { padding:14px 20px; background:var(--panel); display:flex; gap:14px; align-items:center; }
+  header h1 { font-size:16px; font-weight:600; margin:0; }
+  header select, header input { background:#0d1018; color:var(--fg); border:1px solid #333; padding:6px 8px; border-radius:4px; }
+  main { max-width: 1100px; margin: 0 auto; padding: 16px; }
+  video { width:100%; background:black; display:block; border-radius:6px; }
+  .timeline { position:relative; height:48px; background:var(--panel); margin-top:14px; border-radius:4px; overflow:hidden; cursor:ew-resize; user-select:none; }
+  .timeline canvas { display:block; width:100%; height:100%; pointer-events:none; }
+  .playhead { position:absolute; top:-2px; bottom:-2px; width:2px; background:#fff; pointer-events:none; box-shadow:0 0 4px white; }
+  .seg-tip { position:absolute; bottom:100%; left:0; background:#11141a; border:1px solid #333; padding:4px 8px; border-radius:3px; font-size:11px; color:var(--fg); white-space:pre; pointer-events:none; opacity:0; transition:opacity 0.1s; }
+  .scale { display:flex; justify-content:space-between; margin-top:4px; color:var(--muted); font-size:11px; }
+  .controls { margin-top:14px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  button { background:#2a2f3a; color:var(--fg); border:1px solid #3a414f; padding:6px 12px; border-radius:4px; cursor:pointer; font:inherit; }
+  button:hover { background:#3a414f; }
+  .legend { margin-top:18px; display:grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap:8px; }
+  .row { display:flex; align-items:center; gap:8px; padding:6px 8px; background:var(--panel); border-radius:4px; }
+  .swatch { width:14px; height:14px; border-radius:3px; }
+  .row label { flex:1; font-size:13px; }
+  .row select { background:#0d1018; color:var(--fg); border:1px solid #333; padding:3px 6px; border-radius:3px; font:inherit; }
+  .now { margin-top:14px; padding:10px 12px; background:var(--panel); border-radius:4px; font-size:13px; }
+  .now b { color:#9ab; }
+  .asr { color:var(--muted); margin-top:4px; font-style:italic; max-height:60px; overflow:hidden; }
+  .stat { color:var(--muted); margin-left:10px; }
+  .skipping { color:#ff5252; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Multimodal Content Map <span style="color:var(--muted); font-size:11px; font-weight:400;">build v5 ad-hoc URL</span></h1>
+  <select id="videoSelect"></select>
+  <span class="stat" id="info"></span>
+  <span id="dbg" style="font-size:11px; color:var(--muted); margin-left:auto;">md:0 mm:0</span>
+</header>
+<main>
+  <video id="video" controls preload="metadata"></video>
+
+  <div class="timeline" id="timeline"><canvas id="timelineCanvas"></canvas><div class="seg-tip" id="segTip"></div></div>
+  <div class="scale" id="scale"></div>
+
+  <div class="controls">
+    <button id="prevSeg">⏮ Prev segment</button>
+    <button id="nextSeg">Next segment ⏭</button>
+    <button id="nextNC">Skip to next non-content ▶▶</button>
+    <button id="speedBtn">Playback: 1x</button>
+    <button id="autoSkip">Auto-skip: <b id="autoSkipState">off</b></button>
+  </div>
+
+  <div class="now" id="now">Loading…</div>
+
+  <h3 style="margin-top:18px; font-size:13px; color:var(--muted);">CLASS ACTIONS</h3>
+  <div class="legend" id="legend"></div>
+</main>
+
+<script>
+const TAXONOMY = [
+  {key: "core_content", color: "var(--core)",       label: "Core content",  defaultAction: "play"},
+  {key: "intro",        color: "var(--intro)",      label: "Intro",         defaultAction: "play"},
+  {key: "outro",        color: "var(--outro)",      label: "Outro",         defaultAction: "skip"},
+  {key: "sponsorship",  color: "var(--sponsor)",    label: "Sponsorship",   defaultAction: "skip"},
+  {key: "self_promo",   color: "var(--selfpromo)",  label: "Self-promo",    defaultAction: "skip"},
+  {key: "recap",        color: "var(--recap)",      label: "Recap",         defaultAction: "play"},
+  {key: "transition",   color: "var(--transition)", label: "Transition",    defaultAction: "skip"},
+  {key: "dead_air",     color: "var(--deadair)",    label: "Dead air",      defaultAction: "skip"},
+  {key: "waiting_room", color: "var(--waiting)",    label: "Waiting room",  defaultAction: "skip"},
+  {key: "filler",       color: "var(--filler)",     label: "Filler",        defaultAction: "skip"},
+  {key: "unknown",      color: "var(--unknown)",    label: "Unknown",       defaultAction: "play"},
+];
+const TAXONOMY_BY_KEY = Object.fromEntries(TAXONOMY.map(t => [t.key, t]));
+const NON_CONTENT = new Set(["intro","outro","sponsorship","self_promo","recap","transition","dead_air","waiting_room","filler"]);
+
+const VIDEOS = [
+  { id: "test_001", label: "test_001 (corpus)",
+    video: "../sample_videos/csci576/videos_with_ads/test_001.mp4",
+    segs:  ["../work/test_001.segments.classified.json","../work/test_001.segments.json"] },
+  { id: "test_002", label: "test_002 (corpus)",
+    video: "../sample_videos/csci576/videos_with_ads/test_002.mp4",
+    segs:  ["../work/test_002.segments.classified.json","../work/test_002.segments.json"] },
+  { id: "veritasium_collatz", label: "Veritasium — Collatz",
+    video: "../sample_videos/external/094y1Z2wpJg_h264.mp4",
+    segs:  ["../work_external/094y1Z2wpJg_h264.segments.classified.json","../work_external/094y1Z2wpJg_h264.segments.json"] },
+  { id: "veritasium_imaginary", label: "Veritasium — Imaginary Numbers",
+    video: "../sample_videos/external/cUzklzVXJwo_h264.mp4",
+    segs:  ["../work_external/cUzklzVXJwo_h264.segments.classified.json","../work_external/cUzklzVXJwo_h264.segments.json"] },
+  { id: "ltt_airpods", label: "LTT — AirPods Pro 3",
+    video: "../sample_videos/external/ltt_vJIzIH_guPU.mp4",
+    segs:  ["../work_external/ltt_vJIzIH_guPU.segments.classified.json","../work_external/ltt_vJIzIH_guPU.segments.json"] },
+  { id: "wan_first10", label: "LTT WAN show — first 10 min",
+    video: "../sample_videos/external/wan_0xp-pOVTrsI_first10.mp4",
+    segs:  ["../work_external/wan_0xp-pOVTrsI_first10.segments.classified.json","../work_external/wan_0xp-pOVTrsI_first10.segments.json"] },
+  { id: "wendover", label: "Wendover — Iran/Oil",
+    video: "../sample_videos/external/wendover_5qjvluMnyAw.mp4",
+    segs:  ["../work_external/wendover_5qjvluMnyAw.segments.classified.json","../work_external/wendover_5qjvluMnyAw.segments.json"] },
+  { id: "vox", label: "Vox — How America became a superpower",
+    video: "../sample_videos/external/vox_BShvYeyMm_Y.mp4",
+    segs:  ["../work_external/vox_BShvYeyMm_Y.segments.classified.json","../work_external/vox_BShvYeyMm_Y.segments.json"] },
+  { id: "tomscott", label: "Tom Scott — mannequin",
+    video: "../sample_videos/external/tomscott_v2ZhcJcnBE.mp4",
+    segs:  ["../work_external/tomscott_v2ZhcJcnBE.segments.classified.json","../work_external/tomscott_v2ZhcJcnBE.segments.json"] },
+];
+
+const $ = id => document.getElementById(id);
+const video = $("video");
+const timeline = $("timeline");
+const select = $("videoSelect");
+let segments = [];
+let actions = {};
+// Auto-skip defaults to OFF — without this the video can get stuck in a
+// skip-cascade if multiple early segments are non-content and the buffer
+// isn't big enough to seek across them. User flips it on when ready.
+let autoSkip = false;
+let speeds = [1, 1.5, 2, 4];
+let speedIdx = 0;
+
+function fmtTime(s) {
+  s = Math.floor(s);
+  const m = Math.floor(s / 60), ss = String(s % 60).padStart(2,"0");
+  return `${m}:${ss}`;
+}
+
+async function tryFetchJSON(urls) {
+  // Cache-bust by appending current timestamp — works around browser cache
+  // and any intermediate proxy cache (CARC OnDemand etc.).
+  const bust = "?_=" + Date.now();
+  for (const u of urls) {
+    try {
+      const r = await fetch(u + bust, { cache: "no-store" });
+      if (r.ok) return { url: u, data: await r.json() };
+    } catch (e) {}
+  }
+  throw new Error("No segments JSON found at " + urls.join(", "));
+}
+
+function getCSSVar(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
+function paintTimeline() {
+  const canvas = $("timelineCanvas");
+  if (!canvas) return;
+  // Existing playhead and seg-tip survive; only canvas redraws.
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = rect.width * dpr;
+  canvas.height = rect.height * dpr;
+  const ctx = canvas.getContext("2d");
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, rect.width, rect.height);
+  if (!segments.length) return;
+
+  const total = segments[segments.length-1].end_sec;
+  for (const s of segments) {
+    const t = TAXONOMY_BY_KEY[s.label] || TAXONOMY_BY_KEY.unknown;
+    const x = rect.width * s.start_sec / total;
+    const w = Math.max(1, rect.width * (s.end_sec - s.start_sec) / total);
+    const color = t.color.startsWith("var(")
+      ? getCSSVar(t.color.slice(4, -1))
+      : t.color;
+    ctx.fillStyle = color || "#888";
+    ctx.fillRect(x, 0, w, rect.height);
+  }
+
+  // Make sure the playhead exists (it's a sibling of the canvas).
+  if (!$("playhead")) {
+    const head = document.createElement("div");
+    head.className = "playhead"; head.id = "playhead";
+    timeline.appendChild(head);
+  }
+
+  $("scale").innerHTML = `<span>0:00</span><span>${fmtTime(total/2)}</span><span>${fmtTime(total)}</span>`;
+}
+
+window.addEventListener("resize", () => paintTimeline());
+
+function paintLegend() {
+  const dist = {};
+  for (const s of segments) {
+    dist[s.label] = (dist[s.label] || 0) + (s.end_sec - s.start_sec);
+  }
+  const total = segments.length ? segments[segments.length-1].end_sec : 1;
+
+  const legend = $("legend"); legend.innerHTML = "";
+  for (const t of TAXONOMY) {
+    const secs = dist[t.key] || 0;
+    if (secs === 0 && t.key !== "core_content") continue;
+    const row = document.createElement("div");
+    row.className = "row";
+    row.innerHTML = `
+      <div class="swatch" style="background:${t.color}"></div>
+      <label>${t.label} <span class="stat">${(100*secs/total).toFixed(1)}%</span></label>
+      <select data-key="${t.key}">
+        <option value="play"${actions[t.key]==="play"?" selected":""}>play</option>
+        <option value="ff"${actions[t.key]==="ff"?" selected":""}>fast-forward</option>
+        <option value="skip"${actions[t.key]==="skip"?" selected":""}>skip</option>
+      </select>`;
+    legend.appendChild(row);
+  }
+  legend.querySelectorAll("select").forEach(sel => {
+    sel.addEventListener("change", e => {
+      actions[e.target.dataset.key] = e.target.value;
+      saveActions();
+    });
+  });
+}
+
+function saveActions() {
+  try { localStorage.setItem("nc_actions", JSON.stringify(actions)); } catch(e) {}
+}
+function loadActions() {
+  try {
+    actions = JSON.parse(localStorage.getItem("nc_actions") || "null") || {};
+  } catch(e) { actions = {}; }
+  for (const t of TAXONOMY) {
+    if (!(t.key in actions)) actions[t.key] = t.defaultAction;
+  }
+}
+
+function currentSegment() {
+  const t = video.currentTime;
+  for (const s of segments) {
+    if (s.start_sec <= t && t < s.end_sec) return s;
+  }
+  return segments[segments.length-1];
+}
+
+let suspendAutoSkipUntil = 0;  // unix ms — auto-skip silenced until this time
+
+function applyActionForCurrentSegment() {
+  const s = currentSegment();
+  if (!s) return;
+  const action = actions[s.label] || "play";
+  if (Date.now() < suspendAutoSkipUntil) {
+    video.playbackRate = speeds[speedIdx];
+    return;
+  }
+  if (action === "skip" && autoSkip) {
+    video.currentTime = s.end_sec + 0.01;
+    video.playbackRate = speeds[speedIdx];
+  } else if (action === "ff" && autoSkip) {
+    video.playbackRate = 4;
+  } else {
+    video.playbackRate = speeds[speedIdx];
+  }
+}
+
+function paintNow() {
+  const s = currentSegment();
+  if (!s) return;
+  const t = TAXONOMY_BY_KEY[s.label] || TAXONOMY_BY_KEY.unknown;
+  const action = actions[s.label] || "play";
+  const skipping = autoSkip && action === "skip";
+  $("now").innerHTML = `
+    <span style="display:inline-block;width:10px;height:10px;background:${t.color};border-radius:2px;margin-right:6px;"></span>
+    <b>${t.label}</b> ${fmtTime(s.start_sec)}–${fmtTime(s.end_sec)}
+    <span class="stat">action: ${action}${skipping ? ' <span class="skipping">(auto-skipping)</span>' : ''}</span>
+    ${s.rationale ? `<div class="asr">↳ ${s.rationale}</div>` : ""}
+    ${s.asr_text ? `<div class="asr">"${s.asr_text.slice(0,200)}"</div>` : ""}`;
+
+  const head = $("playhead");
+  if (head && segments.length) {
+    const total = segments[segments.length-1].end_sec;
+    head.style.left = (100 * video.currentTime / total) + "%";
+  }
+}
+
+function nextNonContent() {
+  const t = video.currentTime;
+  for (const s of segments) {
+    if (s.start_sec > t && NON_CONTENT.has(s.label)) {
+      // Suppress auto-skip for the duration of this NC segment so the user
+      // can actually inspect it. Auto-skip resumes when the segment ends.
+      const ms = (s.end_sec - s.start_sec) * 1000 + 500;
+      suspendAutoSkipUntil = Date.now() + ms;
+      video.currentTime = s.start_sec;
+      video.play();
+      return;
+    }
+  }
+}
+function prevSeg() {
+  const t = video.currentTime;
+  let last = segments[0];
+  for (const s of segments) {
+    if (s.start_sec >= t - 0.01) break;
+    last = s;
+  }
+  video.currentTime = last.start_sec;
+}
+function nextSeg() {
+  const t = video.currentTime;
+  for (const s of segments) {
+    if (s.start_sec > t + 0.01) { video.currentTime = s.start_sec; return; }
+  }
+}
+
+async function loadVideo(meta) {
+  video.src = meta.video;
+  try {
+    const { url, data } = await tryFetchJSON(meta.segs);
+    segments = data;
+    $("info").textContent = `${segments.length} segs · ${url.split("/").pop()}`;
+  } catch (e) {
+    segments = [];
+    $("info").textContent = "no segments JSON yet";
+  }
+  paintTimeline();
+  paintLegend();
+  paintNow();
+}
+
+function init() {
+  loadActions();
+
+  for (const v of VIDEOS) {
+    const opt = document.createElement("option");
+    opt.value = v.id; opt.textContent = v.label;
+    select.appendChild(opt);
+  }
+
+  const params = new URLSearchParams(location.search);
+  // Ad-hoc demo URL: ?video=... &segs=... lets you point at any pair without
+  // editing the VIDEOS list. Useful on demo day when processing a fresh video.
+  const adhocVideo = params.get("video");
+  const adhocSegs = params.get("segs");
+  if (adhocVideo) {
+    const ad = {
+      id: "adhoc",
+      label: "ad-hoc: " + (adhocVideo.split("/").pop() || adhocVideo),
+      video: adhocVideo,
+      segs: adhocSegs ? [adhocSegs] : [adhocVideo.replace(/\.[^.]+$/, ".segments.classified.json")],
+    };
+    VIDEOS.unshift(ad);
+    const opt = document.createElement("option");
+    opt.value = ad.id; opt.textContent = ad.label;
+    select.insertBefore(opt, select.firstChild);
+  }
+  const startId = params.get("v") || VIDEOS[0].id;
+  select.value = startId;
+  loadVideo(VIDEOS.find(v => v.id === select.value) || VIDEOS[0]);
+
+  select.addEventListener("change", () => {
+    const meta = VIDEOS.find(v => v.id === select.value);
+    if (meta) loadVideo(meta);
+  });
+
+  video.addEventListener("timeupdate", () => { paintNow(); applyActionForCurrentSegment(); });
+
+  // Drag-to-scrub timeline. Canvas + playhead are pointer-events:none, so
+  // mousedown always lands on the timeline div. Suspend auto-skip during drag.
+  let dragging = false;
+  function seekToClientX(clientX) {
+    if (!segments.length) return;
+    const rect = timeline.getBoundingClientRect();
+    const total = segments[segments.length-1].end_sec;
+    const x = Math.max(0, Math.min(rect.width, clientX - rect.left));
+    video.currentTime = (x / rect.width) * total;
+  }
+  function segAtClientX(clientX) {
+    if (!segments.length) return null;
+    const rect = timeline.getBoundingClientRect();
+    const total = segments[segments.length-1].end_sec;
+    const t = ((clientX - rect.left) / rect.width) * total;
+    for (const s of segments) {
+      if (s.start_sec <= t && t < s.end_sec) return s;
+    }
+    return null;
+  }
+  let mdCount = 0, mmCount = 0;
+  function bumpDbg() { const d = $("dbg"); if (d) d.textContent = `md:${mdCount} mm:${mmCount}`; }
+  timeline.addEventListener("mousedown", (e) => {
+    mdCount++; bumpDbg();
+    dragging = true;
+    suspendAutoSkipUntil = Date.now() + 30 * 60 * 1000;
+    seekToClientX(e.clientX);
+    e.preventDefault();
+  });
+  document.addEventListener("mousemove", (e) => {
+    if (dragging) {
+      mmCount++; bumpDbg();
+      seekToClientX(e.clientX);
+      return;
+    }
+    // Hover tooltip — only when not dragging
+    const tip = $("segTip");
+    if (!tip) return;
+    const rect = timeline.getBoundingClientRect();
+    if (e.clientY < rect.top || e.clientY > rect.bottom ||
+        e.clientX < rect.left || e.clientX > rect.right) {
+      tip.style.opacity = 0;
+      return;
+    }
+    const s = segAtClientX(e.clientX);
+    if (!s) { tip.style.opacity = 0; return; }
+    const t = TAXONOMY_BY_KEY[s.label] || TAXONOMY_BY_KEY.unknown;
+    tip.textContent = `${t.label} ${fmtTime(s.start_sec)}–${fmtTime(s.end_sec)}`;
+    tip.style.left = Math.max(0, e.clientX - rect.left - 80) + "px";
+    tip.style.opacity = 1;
+  });
+  document.addEventListener("mouseup", () => {
+    if (dragging) {
+      dragging = false;
+      suspendAutoSkipUntil = 0;
+    }
+  });
+
+  $("prevSeg").onclick = prevSeg;
+  $("nextSeg").onclick = nextSeg;
+  $("nextNC").onclick = nextNonContent;
+  $("speedBtn").onclick = () => {
+    speedIdx = (speedIdx + 1) % speeds.length;
+    video.playbackRate = speeds[speedIdx];
+    $("speedBtn").textContent = `Playback: ${speeds[speedIdx]}x`;
+  };
+  $("autoSkip").onclick = () => {
+    autoSkip = !autoSkip;
+    $("autoSkipState").textContent = autoSkip ? "on" : "off";
+  };
+
+  document.addEventListener("keydown", (e) => {
+    if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;
+    if (e.key === "j") prevSeg();
+    if (e.key === "l") nextSeg();
+    if (e.key === "k") video.paused ? video.play() : video.pause();
+    if (e.key === "s") nextNonContent();
+  });
+}
+
+init();
+</script>
+</body>
+</html>
