@@ -9,3 +9,10 @@ torch                 # ~2GB; needed by CLIPFeatureDetector and TransNetV2Detect
 open_clip_torch       # for CLIPFeatureDetector
 Pillow                # for CLIPFeatureDetector (usually pulled in by open_clip_torch)
 transnetv2-pytorch    # for TransNetV2Detector
+
+faster-whisper
+easyocr
+sentence-transformers
+librosa
+transformers
+accelerate
