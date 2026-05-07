@@ -20,6 +20,109 @@ _NC = {"intro", "outro", "sponsorship", "self_promo", "recap",
        "transition", "dead_air", "waiting_room", "filler"}
 
 
+def bridge_core_content_in_nc(
+    segments: list[dict], max_bridge_sec: float = 30.0
+) -> int:
+    """If a *run* of core_content segments is wedged between two non-content
+    segments of the same class, and the run is short, the LLM likely
+    under-fired on the middle of an ad — bridge by relabelling the run.
+
+    Common case: synthetic content-shaped ad has speech that LLM thinks is
+    real content because it's topically plausible. We detect it as ad at the
+    edges (boundaries fire on the cut in/out) but miss the middle. If the
+    gap is short enough to plausibly be inside one ad, fill it.
+    """
+    fixed = 0
+    i = 0
+    while i < len(segments):
+        # Find a run of core_content segments
+        if segments[i]["label"] != "core_content":
+            i += 1
+            continue
+        run_start = i
+        while i < len(segments) and segments[i]["label"] == "core_content":
+            i += 1
+        run_end = i  # exclusive
+        # Need NC on both sides
+        if run_start == 0 or run_end >= len(segments):
+            continue
+        prev_label = segments[run_start - 1]["label"]
+        next_label = segments[run_end]["label"]
+        # Only bridge across sponsorship/intro/outro/self_promo/recap. dead_air
+        # and transition are short by nature; bridging through them would
+        # convert real content to silence, which is wrong.
+        BRIDGEABLE = {"sponsorship", "intro", "outro", "self_promo", "recap", "filler"}
+        if prev_label not in BRIDGEABLE or next_label not in BRIDGEABLE:
+            continue
+        if prev_label != next_label:
+            continue
+        run_total = (
+            segments[run_end - 1]["end_sec"] - segments[run_start]["start_sec"]
+        )
+        if run_total > max_bridge_sec:
+            continue
+        for k in range(run_start, run_end):
+            segments[k]["label"] = prev_label
+            segments[k]["confidence"] = 0.7
+            segments[k]["rationale"] = (
+                f"[bridge] core_content run sandwiched between {prev_label} blocks — "
+                f"likely the middle of an under-fired non-content block"
+            )
+            fixed += 1
+    return fixed
+
+
+def drop_misplaced_intro_outro(segments: list[dict]) -> int:
+    """Drop intro/outro labels that aren't at the actual start/end of video.
+
+    The LLM fires outro on any segment with position > 0.95 + short ASR,
+    even if it's just a brief bridging phrase mid-sentence followed by
+    more host speech. Real outros are contiguous at the very end. Same
+    for intros at the start. We require the segment to be the trailing
+    (or leading) NC run — anything later (or earlier) reverts to
+    core_content.
+    """
+    fixed = 0
+    # Drop outros that have core_content (or non-outro NC) AFTER them.
+    last_outro_run_end = len(segments)
+    for i in range(len(segments) - 1, -1, -1):
+        if segments[i]["label"] == "outro":
+            last_outro_run_end = i
+        elif segments[i]["label"] == "core_content":
+            break
+    # Drop any outro before last_outro_run_end that has a core_content gap after it
+    in_run = False
+    for i in range(len(segments) - 1, -1, -1):
+        if segments[i]["label"] == "outro":
+            if i < last_outro_run_end:
+                # Check if any core_content segment lies between this outro
+                # and the trailing outro run; if so, this is a misplaced outro
+                misplaced = any(
+                    segments[k]["label"] == "core_content"
+                    for k in range(i + 1, len(segments))
+                )
+                if misplaced:
+                    segments[i]["label"] = "core_content"
+                    segments[i]["confidence"] = 0.7
+                    segments[i]["rationale"] = "[postproc] outro relabeled — core_content follows"
+                    fixed += 1
+
+    # Drop intros that have core_content BEFORE them.
+    for i in range(len(segments)):
+        if segments[i]["label"] == "intro":
+            misplaced = any(
+                segments[k]["label"] == "core_content"
+                for k in range(0, i)
+            )
+            if misplaced:
+                segments[i]["label"] = "core_content"
+                segments[i]["confidence"] = 0.7
+                segments[i]["rationale"] = "[postproc] intro relabeled — core_content precedes"
+                fixed += 1
+
+    return fixed
+
+
 def drop_short_sandwiched(segments: list[dict], max_short_sec: float = 10.0) -> int:
     """Drop short non-content segments sandwiched between core_content.
 
@@ -135,9 +238,18 @@ def main():
     for p in args.paths:
         data = json.loads(p.read_text())
         n, data = fix(data)
+        m = drop_misplaced_intro_outro(data)
         s = drop_short_sandwiched(data, max_short_sec=args.sandwich_max_sec)
+        b = bridge_core_content_in_nc(data, max_bridge_sec=30.0)
+        # consolidate again so the newly-bridged core_content -> NC blocks
+        # merge cleanly with their neighbors
+        try:
+            from _consolidate_nc import consolidate
+            _, data = consolidate(data)
+        except Exception:
+            pass
         p.write_text(json.dumps(data, indent=2))
-        print(f"{p}: {n} rule-fixes, {s} sandwich-drops")
+        print(f"{p}: {n} rule-fixes, {m} misplaced-intro/outro, {s} sandwich-drops, {b} bridges")
 
 
 if __name__ == "__main__":

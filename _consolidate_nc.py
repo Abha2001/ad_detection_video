@@ -39,14 +39,24 @@ def consolidate(segments: list[dict]) -> tuple[int, list[dict]]:
             run = segments[i : j + 1]
             total = run[-1]["end_sec"] - run[0]["start_sec"]
             if total >= MIN_BLOCK_SEC:
-                # Merge into one sponsorship block, preserve only the run's edge
+                # Pick the consolidated label:
+                #   - run is 100% dead_air -> stay dead_air (don't promote
+                #     pure silence to sponsorship)
+                #   - any other mix (transition + dead_air, sponsorship +
+                #     dead_air, etc.) -> sponsorship (the strongest NC
+                #     signal — these runs straddle ad boundaries)
+                labels_in_run = {s["label"] for s in run}
+                if labels_in_run == {"dead_air"}:
+                    dominant = "dead_air"
+                else:
+                    dominant = "sponsorship"
                 merged = {
                     **run[0],
                     "end_sec": run[-1]["end_sec"],
                     "duration_sec": total,
-                    "label": "sponsorship",
+                    "label": dominant,
                     "confidence": min(s.get("confidence", 0.5) for s in run),
-                    "rationale": f"[consolidate] merged {len(run)} adjacent non-content segments ({total:.1f}s)",
+                    "rationale": f"[consolidate] merged {len(run)} adjacent non-content segments ({total:.1f}s) -> {dominant}",
                     "asr_text": " ".join(s.get("asr_text", "") for s in run).strip(),
                     "ocr_text": " | ".join(filter(None, (s.get("ocr_text", "") for s in run))),
                 }
