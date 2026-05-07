@@ -20,6 +20,84 @@ _NC = {"intro", "outro", "sponsorship", "self_promo", "recap",
        "transition", "dead_air", "waiting_room", "filler"}
 
 
+def bridge_by_audio_features(
+    segments: list[dict], max_bridge_sec: float = 90.0, max_distance: float = 0.30
+) -> int:
+    """Bridge core_content gaps whose AUDIO features look like the
+    bordering non-content blocks (and don't look like the surrounding
+    content). The signal that distinguishes a synthetic ad from talking-
+    head content here is silence_ratio (~0 inside ad, >0.05 in content)
+    and motion_energy (high inside ad). Comparing the gap's audio profile
+    to the bordering NC profile is a much cleaner bridge signal than raw
+    duration.
+    """
+    import math
+
+    def profile(seg: dict) -> tuple[float, float, float, float]:
+        return (
+            seg.get("spectral_flatness_mean", 0.0),
+            seg.get("rms_mean", 0.0),
+            seg.get("rms_silence_ratio", 0.0),
+            min(seg.get("motion_energy", 0.0), 5.0) / 5.0,  # normalize
+        )
+
+    def dist(a, b) -> float:
+        return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
+
+    fixed = 0
+    BRIDGEABLE = {"sponsorship", "intro", "outro", "self_promo", "recap", "filler"}
+    i = 0
+    while i < len(segments):
+        if segments[i]["label"] != "core_content":
+            i += 1
+            continue
+        run_start = i
+        while i < len(segments) and segments[i]["label"] == "core_content":
+            i += 1
+        run_end = i
+        if run_start == 0 or run_end >= len(segments):
+            continue
+        prev_label = segments[run_start - 1]["label"]
+        next_label = segments[run_end]["label"]
+        if prev_label not in BRIDGEABLE or next_label not in BRIDGEABLE:
+            continue
+        if prev_label != next_label:
+            continue
+        run_total = (
+            segments[run_end - 1]["end_sec"] - segments[run_start]["start_sec"]
+        )
+        if run_total > max_bridge_sec:
+            continue
+
+        # Average audio profile of the gap and of the bordering NC blocks.
+        gap_segs = segments[run_start:run_end]
+        gap_profile = tuple(
+            sum(p) / len(gap_segs)
+            for p in zip(*(profile(s) for s in gap_segs))
+        )
+        border_profile = tuple(
+            (a + b) / 2
+            for a, b in zip(
+                profile(segments[run_start - 1]),
+                profile(segments[run_end]),
+            )
+        )
+
+        d = dist(gap_profile, border_profile)
+        if d > max_distance:
+            continue
+
+        for k in range(run_start, run_end):
+            segments[k]["label"] = prev_label
+            segments[k]["confidence"] = 0.75
+            segments[k]["rationale"] = (
+                f"[audio-bridge] gap audio profile dist={d:.3f} from bordering "
+                f"{prev_label} -> reclassify"
+            )
+            fixed += 1
+    return fixed
+
+
 def bridge_by_asr_similarity(
     segments: list[dict], min_similarity: float = 0.55, max_bridge_sec: float = 90.0
 ) -> int:
@@ -310,7 +388,11 @@ def main():
         n, data = fix(data)
         m = drop_misplaced_intro_outro(data)
         s = drop_short_sandwiched(data, max_short_sec=args.sandwich_max_sec)
-        b = bridge_core_content_in_nc(data, max_bridge_sec=45.0)
+        # First try the principled audio-feature bridge (gap looks like
+        # bordering NC's audio character). Fall back to duration bridge for
+        # anything not caught.
+        b1 = bridge_by_audio_features(data, max_bridge_sec=90.0, max_distance=0.30)
+        b = b1 + bridge_core_content_in_nc(data, max_bridge_sec=45.0)
         # consolidate again so the newly-bridged core_content -> NC blocks
         # merge cleanly with their neighbors
         try:
