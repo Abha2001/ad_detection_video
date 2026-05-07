@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH --account=biyik_1165
 #SBATCH --partition=gpu
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:v100:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
-#SBATCH --time=02:00:00
+#SBATCH --time=00:30:00
 #SBATCH --job-name=nc_classify_one
 #SBATCH --output=/scratch1/abhajha/csci576/work/classify_one_%j.out
 #SBATCH --error=/scratch1/abhajha/csci576/work/classify_one_%j.err

@@ -7,7 +7,8 @@ Usage:
         --whisper-model base
 
 If --boundaries is not provided, boundaries are auto-detected by combining
-visual frame-difference cuts with audio silence midpoints.
+visual frame-difference cuts with audio silence midpoints, then refined by
+ASR-merge so cuts that fall mid-speech are removed.
 """
 from __future__ import annotations
 
@@ -90,10 +91,22 @@ def run(
         boundaries = boundaries_sec
 
     segments = segments_from_boundaries(boundaries, duration)
-    print(f"[segments] built {len(segments)} segments from {len(boundaries)} boundaries")
+    print(f"[segments] built {len(segments)} initial segments from {len(boundaries)} boundaries")
 
     asr = transcribe(wav_path, model_size=whisper_model)
     assign_asr_to_segments(asr, segments)
+
+    # Drop boundaries that cut mid-speech. Visual + silence over-split a
+    # continuous sentence (camera angle change inside one breath);
+    # word-level ASR tells us when to glue them back together.
+    try:
+        from .asr_merge import merge_speech_continuous
+        before = len(segments)
+        segments = merge_speech_continuous(segments, asr)
+        print(f"[asr-merge] {before} -> {len(segments)} segments")
+    except ImportError:
+        pass
+
     compute_audio_stats(wav_path, segments)
     compute_motion_energy(video_path, segments)
     assign_shot_counts(boundaries, segments)
@@ -138,7 +151,7 @@ def main() -> None:
     )
     ap.add_argument("--whisper-model", default="base")
     ap.add_argument("--classify", action="store_true",
-                    help="Run LLM classifier (requires ANTHROPIC_API_KEY)")
+                    help="Run LLM classifier (requires GPU + Llama model)")
     args = ap.parse_args()
 
     boundaries = (

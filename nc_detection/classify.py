@@ -140,7 +140,10 @@ def _get_pipeline():
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 
-    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+    # float16 is supported on every recent GPU (P100, V100, A100, A40, L40S);
+    # bfloat16 isn't supported on P100/V100 and silently falls back to fp32,
+    # which doubles VRAM and OOMs on 16GB cards.
+    dtype = torch.float16 if torch.cuda.is_available() else torch.float32
     tokenizer = AutoTokenizer.from_pretrained(DEFAULT_MODEL)
     model = AutoModelForCausalLM.from_pretrained(
         DEFAULT_MODEL,
@@ -214,8 +217,15 @@ def classify_segment(seg: EnrichedSegment) -> None:
         seg.rationale = f"parse_failure: {text[:120]}"
 
 
-def classify_segments(segments: Iterable[EnrichedSegment], batch_size: int = 8) -> None:
-    """Classify all segments in place. Batches GPU inference for throughput."""
+def classify_segments(segments: Iterable[EnrichedSegment], batch_size: int = 1) -> None:
+    """Classify all segments in place. Batches GPU inference for throughput.
+
+    The system prompt is ~3K tokens after we added topic-drift, OCR, and
+    branding-disambiguation rules. Each call's KV cache is ~1.1GB on
+    Llama 3.2 3B fp16; on a 16GB GPU we have ~8GB headroom after the model
+    itself, so batch_size=1 is the safe default. Bigger GPUs can pass
+    batch_size up to 8.
+    """
     seg_list = list(segments)
     if not seg_list:
         return
@@ -235,13 +245,25 @@ def classify_segments(segments: Iterable[EnrichedSegment], batch_size: int = 8) 
             ]
         )
 
-    outputs = pipe(
-        prompts,
-        max_new_tokens=120,
-        do_sample=False,
-        return_full_text=False,
-        batch_size=batch_size,
-    )
+    # Process in chunks so we can free CUDA cache between batches and avoid
+    # fragmenting allocations on small GPUs.
+    outputs = []
+    try:
+        import torch
+    except ImportError:
+        torch = None
+    for i in range(0, len(prompts), batch_size):
+        batch = prompts[i : i + batch_size]
+        out = pipe(
+            batch,
+            max_new_tokens=120,
+            do_sample=False,
+            return_full_text=False,
+            batch_size=batch_size,
+        )
+        outputs.extend(out)
+        if torch is not None and torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     for seg, out in zip(seg_list, outputs):
         item = out[0] if isinstance(out, list) else out

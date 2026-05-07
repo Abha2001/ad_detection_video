@@ -15,12 +15,13 @@ import cv2
 #  1. dev: nc_detection/ sits next to a clone named "ad_detection_video/"
 #  2. PR'd: nc_detection/ lives inside the ad_detection_video/ repo itself
 def _find_shot_detection_dir():
-    here = Path(__file__).resolve().parent
-    # PR'd layout: shot_detection.py is in our package's parent.
+    here = Path(__file__).resolve().parent  # nc_detection/
+    # PR'd layout: shot_detection.py is in nc_detection's parent (repo root).
     if (here.parent / "shot_detection.py").exists():
         return here.parent
-    # Dev layout: sibling clone next to our package's parent.
-    sibling = here.parent.parent / "ad_detection_video"
+    # Dev layout: a sibling directory named "ad_detection_video" alongside
+    # nc_detection (i.e. one level up from boundary.py).
+    sibling = here.parent / "ad_detection_video"
     if (sibling / "shot_detection.py").exists():
         return sibling
     return None
