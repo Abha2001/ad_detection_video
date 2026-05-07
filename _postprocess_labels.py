@@ -240,7 +240,7 @@ def main():
         n, data = fix(data)
         m = drop_misplaced_intro_outro(data)
         s = drop_short_sandwiched(data, max_short_sec=args.sandwich_max_sec)
-        b = bridge_core_content_in_nc(data, max_bridge_sec=30.0)
+        b = bridge_core_content_in_nc(data, max_bridge_sec=45.0)
         # consolidate again so the newly-bridged core_content -> NC blocks
         # merge cleanly with their neighbors
         try:
