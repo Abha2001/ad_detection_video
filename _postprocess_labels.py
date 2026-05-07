@@ -345,6 +345,113 @@ def bridge_core_content_in_nc(
     return fixed
 
 
+def label_by_graphic_ocr(segments: list[dict]) -> int:
+    """Generic intro/outro detection via OCR graphic overlays.
+
+    Heuristic: a segment with OCR text whose tokens don't overlap the
+    segment's own ASR is showing a *graphic* (stat overlay, title card,
+    channel watermark, lower-third) — not closed-caption text. At the
+    start of the video this is intro material; at the end it's
+    outro/self_promo. Position alone is too coarse, but position +
+    graphic-OCR-evidence is reliable.
+    """
+    if not segments:
+        return 0
+    fixed = 0
+    total_dur = segments[-1]["end_sec"]
+
+    def ocr_is_graphic(asr: str, ocr: str) -> bool:
+        if not ocr or len(ocr.strip()) < 4:
+            return False
+        # Tokenize lowercase alphabetic words >=3 chars from each.
+        import re
+        ocr_toks = set(t.lower() for t in re.findall(r"[A-Za-z]{3,}", ocr))
+        if not ocr_toks:
+            # all-numeric / symbolic OCR (e.g. "0.2%") — definitely graphic
+            return bool(re.search(r"\d", ocr))
+        asr_toks = set(t.lower() for t in re.findall(r"[A-Za-z]{3,}", asr or ""))
+        # If <30% of OCR tokens appear in ASR, the OCR is graphic content
+        # (overlay, watermark, brand) rather than burned-in captions.
+        overlap = len(ocr_toks & asr_toks) / len(ocr_toks)
+        return overlap < 0.3
+
+    # Intro: scan all segments in first 5% — every one with graphic OCR
+    # becomes intro, plus any leading core_content before the first hit.
+    last_intro_idx = -1
+    for i, s in enumerate(segments):
+        pos = s.get("position_norm") or (s["start_sec"] / total_dur if total_dur else 0)
+        if pos > 0.05:
+            break
+        if s["label"] != "core_content":
+            continue
+        if ocr_is_graphic(s.get("asr_text", ""), s.get("ocr_text", "")):
+            last_intro_idx = i
+    if last_intro_idx >= 0:
+        for k in range(0, last_intro_idx + 1):
+            if segments[k]["label"] == "core_content":
+                segments[k]["label"] = "intro"
+                segments[k]["confidence"] = 0.8
+                segments[k]["rationale"] = (
+                    f"[graphic-ocr] graphic-style OCR detected through pos "
+                    f"{segments[last_intro_idx].get('position_norm', 0):.3f}"
+                )
+                fixed += 1
+
+    # Outro: scan all segments in last 5% — every one with graphic OCR
+    # becomes outro, plus any trailing core_content after the first hit.
+    first_outro_idx = -1
+    for i in range(len(segments) - 1, -1, -1):
+        s = segments[i]
+        pos = s.get("position_norm") or (s["start_sec"] / total_dur if total_dur else 0)
+        if pos < 0.95:
+            break
+        if s["label"] not in ("core_content", "outro", "self_promo"):
+            continue
+        if ocr_is_graphic(s.get("asr_text", ""), s.get("ocr_text", "")):
+            first_outro_idx = i
+    if first_outro_idx >= 0:
+        for k in range(first_outro_idx, len(segments)):
+            if segments[k]["label"] == "core_content":
+                segments[k]["label"] = "outro"
+                segments[k]["confidence"] = 0.8
+                segments[k]["rationale"] = (
+                    f"[graphic-ocr] graphic-style OCR at position "
+                    f"{segments[k].get('position_norm', 0):.3f}"
+                )
+                fixed += 1
+
+    return fixed
+
+
+def merge_consecutive_same_label(segments: list[dict]) -> int:
+    """Merge consecutive segments that share the same label into a single
+    segment so the player timeline shows one solid block per label run.
+    Concatenates ASR/OCR; takes the min confidence."""
+    if not segments:
+        return 0
+    out = [dict(segments[0])]
+    merged = 0
+    for s in segments[1:]:
+        last = out[-1]
+        if s["label"] == last["label"]:
+            last["end_sec"] = s["end_sec"]
+            last["duration_sec"] = last["end_sec"] - last["start_sec"]
+            asr_a = (last.get("asr_text") or "").strip()
+            asr_b = (s.get("asr_text") or "").strip()
+            if asr_b:
+                last["asr_text"] = (asr_a + " " + asr_b).strip() if asr_a else asr_b
+            ocr_a = (last.get("ocr_text") or "").strip()
+            ocr_b = (s.get("ocr_text") or "").strip()
+            if ocr_b:
+                last["ocr_text"] = (ocr_a + " | " + ocr_b).strip(" |") if ocr_a else ocr_b
+            last["confidence"] = min(last.get("confidence", 1.0), s.get("confidence", 1.0))
+            merged += 1
+        else:
+            out.append(dict(s))
+    segments[:] = out
+    return merged
+
+
 def drop_misplaced_intro_outro(segments: list[dict]) -> int:
     """Drop intro/outro labels that aren't at the actual start/end of video.
 
@@ -511,6 +618,8 @@ def main():
     for p in args.paths:
         data = json.loads(p.read_text())
         n, data = fix(data)
+        # Generic intro/outro detection via OCR graphic-overlay signal.
+        g = label_by_graphic_ocr(data)
         m = drop_misplaced_intro_outro(data)
         s = drop_short_sandwiched(data, max_short_sec=args.sandwich_max_sec)
         # First: extend NC blocks via audio similarity over neighbors that
@@ -520,15 +629,13 @@ def main():
         # Then: audio-feature bridge for gaps inside an NC run.
         b = bridge_by_audio_features(data, max_bridge_sec=90.0, max_distance=0.30)
         b += e
-        # consolidate again so the newly-bridged core_content -> NC blocks
-        # merge cleanly with their neighbors
-        try:
-            from _consolidate_nc import consolidate
-            _, data = consolidate(data)
-        except Exception:
-            pass
+        # Merge consecutive same-label segments so the player shows one
+        # solid block per label run instead of stripes. We don't run the
+        # full consolidate again because its dominant-label logic would
+        # re-collapse outro+self_promo+dead_air mixes back to sponsorship.
+        mc = merge_consecutive_same_label(data)
         p.write_text(json.dumps(data, indent=2))
-        print(f"{p}: {n} rule-fixes, {m} misplaced-intro/outro, {s} sandwich-drops, {b} bridges")
+        print(f"{p}: {n} rule-fixes, {g} graphic-ocr, {m} misplaced-intro/outro, {s} sandwich-drops, {b} bridges, {mc} same-label merges")
 
 
 if __name__ == "__main__":
