@@ -19,6 +19,25 @@ NON_CONTENT = {"intro", "outro", "sponsorship", "self_promo", "recap",
 MIN_BLOCK_SEC = 15.0
 
 
+def _trim_trailing_dead_air(
+    run: list[dict], min_trim_sec: float = 5.0
+) -> tuple[list[dict], list[dict]]:
+    """If a run ends with substantial dead_air (>= min_trim_sec total),
+    split it off so it remains a separate dead_air block. Short tail
+    dead_air stays merged — those are typically brief silences inside
+    a single ad and shouldn't break the bridge's same-label-border check."""
+    j = len(run)
+    while j > 0 and run[j - 1]["label"] == "dead_air":
+        j -= 1
+    if j == 0 or j == len(run):
+        return run, []
+    tail = run[j:]
+    tail_dur = tail[-1]["end_sec"] - tail[0]["start_sec"]
+    if tail_dur < min_trim_sec:
+        return run, []  # tail is too short to be meaningful — keep merged
+    return run[:j], tail
+
+
 def consolidate(segments: list[dict]) -> tuple[int, list[dict]]:
     if not segments:
         return 0, segments
@@ -36,18 +55,36 @@ def consolidate(segments: list[dict]) -> tuple[int, list[dict]]:
         while j + 1 < len(segments) and segments[j + 1]["label"] in NON_CONTENT:
             j += 1
         if j > i:
-            run = segments[i : j + 1]
-            total = run[-1]["end_sec"] - run[0]["start_sec"]
+            full_run = segments[i : j + 1]
+            # If run ends with pure dead_air, trim it off — keep it as a
+            # separate dead_air block so the post-ad silence isn't
+            # absorbed into the sponsorship label.
+            run, tail_dead_air = _trim_trailing_dead_air(full_run)
+            total = run[-1]["end_sec"] - run[0]["start_sec"] if run else 0
             if total >= MIN_BLOCK_SEC:
                 # Pick the consolidated label:
-                #   - run is 100% dead_air -> stay dead_air (don't promote
-                #     pure silence to sponsorship)
-                #   - any other mix (transition + dead_air, sponsorship +
-                #     dead_air, etc.) -> sponsorship (the strongest NC
-                #     signal — these runs straddle ad boundaries)
+                #   - pure dead_air -> dead_air
+                #   - pure self_promo -> self_promo (preserve "subscribe" CTA)
+                #   - pure outro -> outro
+                #   - pure intro -> intro
+                #   - any other mix (incl. just transitions, sponsorship +
+                #     dead_air, etc.) -> sponsorship
                 labels_in_run = {s["label"] for s in run}
                 if labels_in_run == {"dead_air"}:
                     dominant = "dead_air"
+                elif labels_in_run == {"self_promo"}:
+                    dominant = "self_promo"
+                elif labels_in_run == {"outro"}:
+                    dominant = "outro"
+                elif labels_in_run == {"intro"}:
+                    dominant = "intro"
+                # pure-with-dead_air variants (e.g. self_promo + dead_air at end)
+                elif labels_in_run == {"self_promo", "dead_air"}:
+                    dominant = "self_promo"
+                elif labels_in_run == {"outro", "dead_air"}:
+                    dominant = "outro"
+                elif labels_in_run == {"intro", "dead_air"}:
+                    dominant = "intro"
                 else:
                     dominant = "sponsorship"
                 merged = {
@@ -62,6 +99,9 @@ def consolidate(segments: list[dict]) -> tuple[int, list[dict]]:
                 }
                 out.append(merged)
                 fixed += len(run) - 1
+                # Re-emit any trailing dead_air segments untouched
+                for da in tail_dead_air:
+                    out.append(da)
                 i = j + 1
                 continue
         out.append(s)

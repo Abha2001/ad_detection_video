@@ -20,6 +20,80 @@ _NC = {"intro", "outro", "sponsorship", "self_promo", "recap",
        "transition", "dead_air", "waiting_room", "filler"}
 
 
+def extend_nc_via_audio(
+    segments: list[dict], max_extend_sec: float = 25.0, max_distance: float = 0.20
+) -> int:
+    """Extend non-content blocks backwards/forwards over adjacent
+    core_content segments whose audio profile matches the NC block's.
+
+    Catches the case where the LLM mis-classified the start of an ad as
+    core_content because Whisper produced rich-looking (but gibberish)
+    ASR over the ad's foreign-language audio. The audio character — low
+    silence_ratio, higher motion — gives us a clean signal that the
+    'content' segment is actually still inside the ad.
+    """
+    import math
+
+    BRIDGEABLE = {"sponsorship", "intro", "outro", "self_promo", "recap", "filler"}
+
+    def profile(seg: dict) -> tuple[float, float, float, float]:
+        return (
+            seg.get("spectral_flatness_mean", 0.0),
+            seg.get("rms_mean", 0.0),
+            seg.get("rms_silence_ratio", 0.0),
+            min(seg.get("motion_energy", 0.0), 5.0) / 5.0,
+        )
+
+    def dist(a, b) -> float:
+        return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
+
+    fixed = 0
+    for i in range(len(segments)):
+        s = segments[i]
+        if s["label"] not in BRIDGEABLE:
+            continue
+        nc_profile = profile(s)
+
+        # Extend backwards over adjacent core_content with matching audio.
+        extended_back = 0
+        j = i - 1
+        while j >= 0 and segments[j]["label"] == "core_content":
+            d = dist(profile(segments[j]), nc_profile)
+            seg_dur = segments[j]["end_sec"] - segments[j]["start_sec"]
+            if extended_back + seg_dur > max_extend_sec:
+                break
+            if d > max_distance:
+                break
+            segments[j]["label"] = s["label"]
+            segments[j]["confidence"] = 0.7
+            segments[j]["rationale"] = (
+                f"[extend-back] audio profile dist={d:.3f} from {s['label']}"
+            )
+            extended_back += seg_dur
+            fixed += 1
+            j -= 1
+
+        # Extend forwards
+        extended_fwd = 0
+        j = i + 1
+        while j < len(segments) and segments[j]["label"] == "core_content":
+            d = dist(profile(segments[j]), nc_profile)
+            seg_dur = segments[j]["end_sec"] - segments[j]["start_sec"]
+            if extended_fwd + seg_dur > max_extend_sec:
+                break
+            if d > max_distance:
+                break
+            segments[j]["label"] = s["label"]
+            segments[j]["confidence"] = 0.7
+            segments[j]["rationale"] = (
+                f"[extend-fwd] audio profile dist={d:.3f} from {s['label']}"
+            )
+            extended_fwd += seg_dur
+            fixed += 1
+            j += 1
+    return fixed
+
+
 def bridge_by_audio_features(
     segments: list[dict], max_bridge_sec: float = 90.0, max_distance: float = 0.30
 ) -> int:
@@ -220,6 +294,104 @@ def bridge_core_content_in_nc(
     return fixed
 
 
+# Use [’'] for both straight and curly apostrophe — Whisper outputs curly.
+_AP = r"[’']"
+_INTRO_PHRASES = [
+    rf"\bin today{_AP}?s video\b",
+    r"\bin this video\b",
+    r"\bwelcome (back )?(to my channel|everyone)\b",
+    rf"\btoday (we|i{_AP}?m|i am)\s+(?:going to|gonna|will)\b",
+    rf"\b(let{_AP}?s|let us) (get|jump|dive)\s+(?:right )?(?:in|into)\b",
+    r"\bpulling back the curtain\b",
+    r"\bsitting down with\b",
+]
+_OUTRO_PHRASES = [
+    r"\bthanks for watching\b",
+    r"\bsee you (next|in|on the next)\b",
+    r"\b(catch|see) you (later|guys|all)\b",
+    r"\b(?:until|till) (?:the )?next time\b",
+    r"\bhope (you|that) (you )?enjoyed\b",
+    r"\bawesome\.\s+well\b",  # "Awesome. Well, ..."
+]
+
+
+def label_phrase_based_intro_outro(segments: list[dict]) -> int:
+    """Fire intro/outro on segments whose ASR contains a strong content-style
+    intro or outro phrase, even with rich ASR. The position-based rule misses
+    these because the host launches straight into a hook ('in today's video,
+    I'm pulling back the curtain') instead of a silent bumper."""
+    import re
+
+    if not segments:
+        return 0
+    fixed = 0
+    total_dur = segments[-1]["end_sec"]
+    intro_re = re.compile("|".join(_INTRO_PHRASES), re.IGNORECASE)
+    outro_re = re.compile("|".join(_OUTRO_PHRASES), re.IGNORECASE)
+
+    # Find first intro hit in the first 15% of the video — promote to intro and
+    # extend label backwards/forwards over adjacent core_content with no
+    # speech-pause break (so the whole opening hook gets labeled, not just
+    # the segment that contained the phrase).
+    intro_idx = -1
+    for i, s in enumerate(segments):
+        if s["label"] != "core_content":
+            continue
+        pos = s.get("position_norm") or (s["start_sec"] / total_dur if total_dur else 0)
+        if pos > 0.15:
+            break
+        if intro_re.search(s.get("asr_text", "") or ""):
+            intro_idx = i
+            break
+    if intro_idx >= 0:
+        # extend back to start of video (skip leading dead_air alone)
+        start = 0
+        end = intro_idx + 1
+        # extend forward through neighbors that are still in first ~5% of video
+        while end < len(segments):
+            s = segments[end]
+            pos = s.get("position_norm") or (s["start_sec"] / total_dur if total_dur else 0)
+            if pos > 0.05 or s["label"] not in ("core_content", "intro"):
+                break
+            end += 1
+        for k in range(start, end):
+            if segments[k]["label"] in ("core_content", "intro"):
+                segments[k]["label"] = "intro"
+                segments[k]["confidence"] = 0.85
+                segments[k]["rationale"] = (
+                    f"[phrase] intro phrase detected; opening hook at pos "
+                    f"{segments[k].get('position_norm', 0):.3f}"
+                )
+                fixed += 1
+
+    # Outro: scan from the end backwards, find the first segment with an
+    # outro-style phrase. Promote it and any following core_content to outro
+    # (real outros run to end of video).
+    last_outro_idx = -1
+    for i in range(len(segments) - 1, -1, -1):
+        s = segments[i]
+        if s["label"] not in ("core_content", "outro", "self_promo", "dead_air"):
+            break
+        pos = s.get("position_norm") or (s["start_sec"] / total_dur if total_dur else 0)
+        if pos < 0.85:
+            break
+        if outro_re.search(s.get("asr_text", "") or ""):
+            last_outro_idx = i
+            break
+    if last_outro_idx >= 0:
+        for k in range(last_outro_idx, len(segments)):
+            if segments[k]["label"] == "core_content":
+                segments[k]["label"] = "outro"
+                segments[k]["confidence"] = 0.85
+                segments[k]["rationale"] = (
+                    f"[phrase] outro phrase at pos "
+                    f"{segments[k].get('position_norm', 0):.3f}"
+                )
+                fixed += 1
+
+    return fixed
+
+
 def drop_misplaced_intro_outro(segments: list[dict]) -> int:
     """Drop intro/outro labels that aren't at the actual start/end of video.
 
@@ -386,12 +558,18 @@ def main():
     for p in args.paths:
         data = json.loads(p.read_text())
         n, data = fix(data)
+        # Phrase-based intro/outro detection runs before the misplaced-cleanup
+        # so any newly-labeled intro/outro can still be sanity-checked.
+        ph = label_phrase_based_intro_outro(data)
         m = drop_misplaced_intro_outro(data)
         s = drop_short_sandwiched(data, max_short_sec=args.sandwich_max_sec)
-        # Audio-feature bridge only — no duration fallback. Bridge fires
-        # only when the gap's audio profile actually matches the bordering
-        # NC's audio profile, so we never bridge "by coincidence of length".
+        # First: extend NC blocks via audio similarity over neighbors that
+        # the LLM mis-classified as core_content (e.g., gibberish ASR over
+        # non-English ad audio). This catches the late-start of ads.
+        e = extend_nc_via_audio(data, max_extend_sec=25.0, max_distance=0.20)
+        # Then: audio-feature bridge for gaps inside an NC run.
         b = bridge_by_audio_features(data, max_bridge_sec=90.0, max_distance=0.30)
+        b += e
         # consolidate again so the newly-bridged core_content -> NC blocks
         # merge cleanly with their neighbors
         try:
@@ -400,7 +578,7 @@ def main():
         except Exception:
             pass
         p.write_text(json.dumps(data, indent=2))
-        print(f"{p}: {n} rule-fixes, {m} misplaced-intro/outro, {s} sandwich-drops, {b} bridges")
+        print(f"{p}: {n} rule-fixes, {ph} phrase-intro/outro, {m} misplaced-intro/outro, {s} sandwich-drops, {b} bridges")
 
 
 if __name__ == "__main__":
