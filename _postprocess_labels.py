@@ -388,11 +388,10 @@ def main():
         n, data = fix(data)
         m = drop_misplaced_intro_outro(data)
         s = drop_short_sandwiched(data, max_short_sec=args.sandwich_max_sec)
-        # First try the principled audio-feature bridge (gap looks like
-        # bordering NC's audio character). Fall back to duration bridge for
-        # anything not caught.
-        b1 = bridge_by_audio_features(data, max_bridge_sec=90.0, max_distance=0.30)
-        b = b1 + bridge_core_content_in_nc(data, max_bridge_sec=45.0)
+        # Audio-feature bridge only — no duration fallback. Bridge fires
+        # only when the gap's audio profile actually matches the bordering
+        # NC's audio profile, so we never bridge "by coincidence of length".
+        b = bridge_by_audio_features(data, max_bridge_sec=90.0, max_distance=0.30)
         # consolidate again so the newly-bridged core_content -> NC blocks
         # merge cleanly with their neighbors
         try:
