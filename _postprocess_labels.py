@@ -20,6 +20,76 @@ _NC = {"intro", "outro", "sponsorship", "self_promo", "recap",
        "transition", "dead_air", "waiting_room", "filler"}
 
 
+def bridge_by_asr_similarity(
+    segments: list[dict], min_similarity: float = 0.55, max_bridge_sec: float = 90.0
+) -> int:
+    """Bridge via ASR semantic similarity, not just duration.
+
+    For each run of core_content with NC of the same label on both sides,
+    embed (left_NC.asr + right_NC.asr) and (gap.asr) and compare cosines.
+    If similar enough, the gap is likely continuing the same ad/content,
+    so we relabel.
+    """
+    try:
+        from sentence_transformers import SentenceTransformer
+    except ImportError:
+        return 0
+    import numpy as np
+
+    model = SentenceTransformer("sentence-transformers/all-MiniLM-L12-v2")
+
+    fixed = 0
+    BRIDGEABLE = {"sponsorship", "intro", "outro", "self_promo", "recap", "filler"}
+    i = 0
+    while i < len(segments):
+        if segments[i]["label"] != "core_content":
+            i += 1
+            continue
+        run_start = i
+        while i < len(segments) and segments[i]["label"] == "core_content":
+            i += 1
+        run_end = i
+        if run_start == 0 or run_end >= len(segments):
+            continue
+        prev_label = segments[run_start - 1]["label"]
+        next_label = segments[run_end]["label"]
+        if prev_label not in BRIDGEABLE or next_label not in BRIDGEABLE:
+            continue
+        if prev_label != next_label:
+            continue
+        run_total = (
+            segments[run_end - 1]["end_sec"] - segments[run_start]["start_sec"]
+        )
+        if run_total > max_bridge_sec:
+            continue
+
+        # Embed and compare
+        gap_text = " ".join(
+            segments[k].get("asr_text", "") for k in range(run_start, run_end)
+        ).strip()
+        ref_text = (
+            segments[run_start - 1].get("asr_text", "")
+            + " "
+            + segments[run_end].get("asr_text", "")
+        ).strip()
+        if not gap_text or not ref_text:
+            continue
+        emb = model.encode([gap_text, ref_text], normalize_embeddings=True)
+        sim = float(np.dot(emb[0], emb[1]))
+        if sim < min_similarity:
+            continue
+
+        for k in range(run_start, run_end):
+            segments[k]["label"] = prev_label
+            segments[k]["confidence"] = 0.7
+            segments[k]["rationale"] = (
+                f"[asr-bridge] gap ASR cos-sim={sim:.2f} to bordering {prev_label} "
+                f"-> reclassify as {prev_label}"
+            )
+            fixed += 1
+    return fixed
+
+
 def bridge_core_content_in_nc(
     segments: list[dict], max_bridge_sec: float = 30.0
 ) -> int:
