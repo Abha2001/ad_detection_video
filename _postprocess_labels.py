@@ -37,10 +37,18 @@ def _get_st_model():
 
 def _asr_sim(a: str, b: str) -> float:
     """Cosine similarity between ASR strings via sentence-transformers.
-    Returns 1.0 if either is empty (so audio-only check applies).
-    """
-    if not a or not b or len(a) < 5 or len(b) < 5:
-        return 1.0
+    Returns 1.0 if BOTH are empty/short (audio-only check applies).
+    Returns 0.0 if exactly one has substantial speech and the other
+    doesn't — that's a speech↔non-speech boundary, definitely shouldn't
+    extend across it."""
+    a = (a or "").strip()
+    b = (b or "").strip()
+    a_short = len(a) < 5
+    b_short = len(b) < 5
+    if a_short and b_short:
+        return 1.0  # both empty → audio-only decision
+    if a_short != b_short:
+        return 0.0  # one has speech, the other doesn't → boundary
     m = _get_st_model()
     if not m:
         return 1.0
@@ -375,48 +383,54 @@ def label_by_graphic_ocr(segments: list[dict]) -> int:
         overlap = len(ocr_toks & asr_toks) / len(ocr_toks)
         return overlap < 0.3
 
-    # Intro: scan all segments in first 5% — every one with graphic OCR
-    # becomes intro, plus any leading core_content before the first hit.
-    last_intro_idx = -1
+    # Intro = contiguous run from segment 0 where graphic OCR is present.
+    # Stop at the first segment without graphic OCR — later graphic OCR
+    # (lower-third name plates during the interview, channel watermarks,
+    # etc.) is content, not intro.
+    intro_end = 0
     for i, s in enumerate(segments):
         pos = s.get("position_norm") or (s["start_sec"] / total_dur if total_dur else 0)
-        if pos > 0.05:
+        if pos > 0.10:
             break
-        if s["label"] != "core_content":
-            continue
+        if s["label"] not in ("core_content", "intro"):
+            break
         if ocr_is_graphic(s.get("asr_text", ""), s.get("ocr_text", "")):
-            last_intro_idx = i
-    if last_intro_idx >= 0:
-        for k in range(0, last_intro_idx + 1):
+            intro_end = i + 1
+        else:
+            # First segment without graphic OCR — intro ended.
+            break
+    if intro_end > 0:
+        for k in range(intro_end):
             if segments[k]["label"] == "core_content":
                 segments[k]["label"] = "intro"
                 segments[k]["confidence"] = 0.8
                 segments[k]["rationale"] = (
-                    f"[graphic-ocr] graphic-style OCR detected through pos "
-                    f"{segments[last_intro_idx].get('position_norm', 0):.3f}"
+                    f"[graphic-ocr] contiguous intro graphic OCR; ends at "
+                    f"{segments[k].get('position_norm', 0):.3f}"
                 )
                 fixed += 1
 
-    # Outro: scan all segments in last 5% — every one with graphic OCR
-    # becomes outro, plus any trailing core_content after the first hit.
-    first_outro_idx = -1
+    # Outro = contiguous run from end backwards where graphic OCR is
+    # present. Stop at the first segment without graphic OCR.
+    outro_start = len(segments)
     for i in range(len(segments) - 1, -1, -1):
         s = segments[i]
         pos = s.get("position_norm") or (s["start_sec"] / total_dur if total_dur else 0)
-        if pos < 0.95:
+        if pos < 0.90:
             break
-        if s["label"] not in ("core_content", "outro", "self_promo"):
-            continue
+        if s["label"] not in ("core_content", "outro", "self_promo", "dead_air"):
+            break
         if ocr_is_graphic(s.get("asr_text", ""), s.get("ocr_text", "")):
-            first_outro_idx = i
-    if first_outro_idx >= 0:
-        for k in range(first_outro_idx, len(segments)):
+            outro_start = i
+        else:
+            break
+    if outro_start < len(segments):
+        for k in range(outro_start, len(segments)):
             if segments[k]["label"] == "core_content":
                 segments[k]["label"] = "outro"
                 segments[k]["confidence"] = 0.8
                 segments[k]["rationale"] = (
-                    f"[graphic-ocr] graphic-style OCR at position "
-                    f"{segments[k].get('position_norm', 0):.3f}"
+                    f"[graphic-ocr] contiguous outro graphic OCR"
                 )
                 fixed += 1
 
